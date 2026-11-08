@@ -1,6 +1,7 @@
 import type { ModelMessage, ToolResultPart } from 'ai'
 import { z } from 'zod'
 import type { Agent } from './agent'
+import type { RunCleanup } from './cleanup'
 import type { HookStopResult, StopOptions } from './hooks'
 import type { AgentState, TerminalChildRecord } from './state'
 
@@ -60,6 +61,8 @@ export interface ToolContext {
 	 * async work that supports cooperative cancellation.
 	 */
 	signal: AbortSignal
+	/** Trusted resource owners must reserve ownership before activation. Unknown work remains uncertain. */
+	cleanup?: RunCleanup
 
 	/**
 	 * Whether the current run should surface live model streaming events.
@@ -149,6 +152,7 @@ export interface ToolContext {
 
 /** Minimal interface for a child agent run — avoids circular import with AgentRun. */
 export interface SubAgentRunHandle extends AsyncIterable<import('./agent-run').AgentEvent> {
+	readonly cleanup?: RunCleanup
 	result: Promise<SubAgentResult>
 	running: boolean
 }

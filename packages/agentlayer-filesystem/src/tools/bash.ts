@@ -10,6 +10,7 @@ export function createBashTool(opts?: { cwd?: string; env?: NodeJS.ProcessEnv })
 				cwd,
 				timeoutMs: input.timeout,
 				signal: ctx.signal,
+				cleanup: ctx.cleanup,
 				// node's spawn() REPLACES the child env when `env` is provided (it does not
 				// merge), so merge over process.env here to preserve PATH/HOME/etc. Leaving
 				// env undefined keeps full inheritance from the parent process (prior behavior).

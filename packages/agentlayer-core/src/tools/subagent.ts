@@ -328,6 +328,7 @@ function createSubagentsToolImplementation(opts: CreateSubagentsToolOptions, sup
 				? await deriveChildPromptCacheKey(ctx.promptCacheKey, agentId)
 				: undefined
 			const childRun = childAgent.run({
+				cleanupParent: ctx.cleanup,
 				state: childState,
 				signal: ctx.signal,
 				stream: ctx.stream,
