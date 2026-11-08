@@ -102,3 +102,34 @@ re-parked, based on `state.pendingToolCalls`.
 `bun test` (see `test/`) covers the loop against a mocked AI SDK model
 (`test/mocks.ts`), hooks, approvals, sub-agent pausing/resuming, stop conditions, token
 usage accounting, and tool interface `.define()` contracts.
+
+
+## Cleanup feasibility prototype
+
+`AgentRun.stopAndAwaitCleanup({ deadlineMs, expectedGeneration? })` closes resource admission synchronously,
+requests cooperative stop and awaits the attached producer and registered resource owners. The first valid
+call owns the deadline; concurrent/reentrant calls share one retained operation. A stale expected generation
+returns `uncertain` without stopping the current run. Each run has an immutable in-memory `runId`; nested
+runs admitted through `cleanupParent` share their root generation while retaining distinct run IDs.
+
+Trusted SDK adapters can reserve ownership before activation with `run.cleanup.startResource(id, start)`.
+The synchronous `start` callback returns `{ value, stop, waitForCleanup }`; the latter must attest actual
+completion of every writer owned by that adapter. It must return `uncertain` when ownership or completion
+cannot be established. Registration after admission closes is rejected before `start` runs. Registration
+is reserved before the callback, so a stop racing synchronous activation also awaits the resource.
+This is an instrumentation trust contract, **not** OS containment, discovery of escaped descendants,
+proof from an empty registry, or authorization to replace a writer.
+
+Configured extension callbacks, custom model providers, dynamic provider-option factories and tool definitions are conservatively marked uninstrumented before the producer starts. Event observers are marked before dispatch and are not newly dispatched after admission closes. Current generic tools are also marked uninstrumented before execution. Model-provider transport
+is also uncertain: AI SDK result completion and the current Codex bridge's fiber cancellation do not attest
+all client/transport callbacks. Filesystem process execution registers its stop/wait path but permanently
+marks descendant ownership uncertain: leader exit, closed stdio or best-effort process-group killing cannot
+prove escaped/detached writers stopped. These markers cannot be cleared merely because a run promise
+finished. The model/loop receives the internal stop signal, while tools retain the exact caller signal for backward compatibility. Instrumented tools use `ctx.cleanup` stop callbacks; generic tools that ignore that ownership contract remain uncertain. Existing behavior remains when the cleanup API is not invoked.
+
+The finite positive tests use a deliberately instrumented supervisor that acknowledges the actual close of
+its exact file-writing grandchild, inside nested SDK runs. Negative tests exercise real escaped writers,
+late loopback HTTP/WebSocket callbacks, generic tool completion, deadlines, failures and stale generations.
+They do not establish a complete production backend or guarantee arbitrary tools, descendants or remote
+effects. The current coding backends can therefore still return `uncertain`; this prototype alone does not
+complete HumanLayer automatic progression, installed integration or release provenance.

@@ -1,6 +1,7 @@
 import { type SpawnOptionsWithoutStdio, spawn } from 'node:child_process'
 import type { Readable } from 'node:stream'
 import { setTimeout as delay } from 'node:timers/promises'
+import type { RunCleanup } from '@humanlayer/agentlayer-core'
 
 const SIGKILL_GRACE_MS = 200
 const STDIO_CLOSE_GRACE_MS = 100
@@ -24,9 +25,29 @@ export async function streamToString(stream: Readable | null | undefined): Promi
 export async function runProcess(
 	command: string,
 	args: string[],
-	options: SpawnOptionsWithoutStdio & { timeoutMs?: number; signal?: AbortSignal } = {},
+	options: SpawnOptionsWithoutStdio & { timeoutMs?: number; signal?: AbortSignal; cleanup?: RunCleanup } = {},
 ): Promise<ProcessResult> {
-	const { timeoutMs, signal, ...spawnOptions } = options
+	const { cleanup, ...processOptions } = options
+	if (cleanup) {
+		const id = `process:${crypto.randomUUID()}`
+		return cleanup.startResource(id, () => {
+			// Existing process groups/leader/stdio cannot attest escaped or detached descendants.
+			cleanup.markUncertain(`${id}:descendants`)
+			const stop = new AbortController()
+			const signal = processOptions.signal ? AbortSignal.any([processOptions.signal, stop.signal]) : stop.signal
+			const result = runProcess(command, args, { ...processOptions, signal })
+			const completed = result.then(
+				() => ({ status: 'uncertain' as const, reason: 'untracked_resource' as const }),
+				() => ({ status: 'uncertain' as const, reason: 'cleanup_failed' as const }),
+			)
+			return {
+				value: result,
+				stop: () => stop.abort(),
+				waitForCleanup: () => completed,
+			}
+		})
+	}
+	const { timeoutMs, signal, ...spawnOptions } = processOptions
 	const child = spawn(command, args, {
 		...spawnOptions,
 		stdio: ['ignore', 'pipe', 'pipe'],

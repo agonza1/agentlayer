@@ -1,6 +1,7 @@
 import type { FinishReason as AiSdkFinishReason, LanguageModel, ModelMessage, TextStreamPart, ToolChoice } from 'ai'
 import { streamText, tool as toAiSdkTool } from 'ai'
 import { type AgentEvent, AgentRun } from './agent-run'
+import type { CleanupReceipt, RunCleanup } from './cleanup'
 import {
 	type AutoCompactConfig,
 	buildCompactionRequestText,
@@ -143,6 +144,8 @@ export interface RunResult {
 }
 
 export interface RunOptions {
+	/** Register this child before activation in its existing parent run. */
+	cleanupParent?: RunCleanup
 	state: AgentState
 	signal?: AbortSignal
 	stream?: boolean
@@ -150,6 +153,7 @@ export interface RunOptions {
 }
 
 export interface CompactOptions {
+	cleanupParent?: RunCleanup
 	state: AgentState
 	signal?: AbortSignal
 	stream?: boolean
@@ -159,6 +163,35 @@ export interface CompactOptions {
 	trigger?: CompactionTrigger
 	/** Override native-tail retention for this explicit checkpoint. */
 	keepRecentTokens?: number
+}
+
+function startAgentRun(
+	options: { signal?: AbortSignal; stream?: boolean; cleanupParent?: RunCleanup },
+	execute: (signal: AbortSignal, run: AgentRun) => Promise<void>,
+): AgentRun {
+	const run = new AgentRun({ cleanupParent: options.cleanupParent })
+	const start = () => {
+		run.stream = options.stream === true
+		run.startProducer((signal) => execute(signal, run), options.signal)
+		return run
+	}
+	if (!options.cleanupParent) return start()
+	let completion: Promise<CleanupReceipt> | undefined
+	const cleanup = run.cleanup
+	return options.cleanupParent.startResource(`child-run:${run.runId}`, () => ({
+		value: start(),
+		stop: ({ deadlineMs }) => {
+			completion = cleanup.stopAndAwaitCleanup({ deadlineMs })
+			return completion.then(() => {})
+		},
+		waitForCleanup: async () => {
+			if (!completion) return { status: 'uncertain', reason: 'untracked_resource' }
+			const receipt = await completion
+			return receipt.status === 'clean'
+				? { status: 'clean' }
+				: { status: 'uncertain', reason: receipt.reason === 'deadline' ? 'cleanup_failed' : receipt.reason }
+		},
+	}))
 }
 
 function convertTools(tools: Record<string, Tool<any, any>>) {
@@ -314,6 +347,7 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 	private forkConfig: ForkAgentConfig | undefined
 
 	private modelProvider: ModelProvider
+	private readonly uninstrumentedExtensions: boolean
 
 	constructor(config: AgentConfig<TTools>) {
 		this.model = config.model
@@ -333,21 +367,31 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 		this.forkConfig = config.fork
 		this.hooks = config.hooks
 		this.modelProvider = config.modelProvider ?? new ModelProvider()
+		this.uninstrumentedExtensions = Boolean(
+			config.onError ||
+				config.onStop ||
+				config.onApprovalRequested ||
+				config.stopWhen ||
+				config.modelProvider ||
+				typeof config.providerOptions === 'function' ||
+				Object.values(config.hooks ?? {}).some((hooks) => hooks?.length) ||
+				Object.keys(config.tools).length,
+		)
 	}
 
 	run(options: RunOptions): AgentRun {
-		const agentRun = new AgentRun()
-		agentRun.stream = options.stream === true
-		this.executeLoop(options, agentRun)
-		return agentRun
+		return startAgentRun(options, (signal, run) => {
+			if (this.uninstrumentedExtensions) run.cleanup.markUncertain('configured-extensions')
+			return this.executeLoop({ ...options, signal, toolSignal: options.signal }, run)
+		})
 	}
 
 	/** Create one explicit compaction checkpoint without entering the normal tool loop. */
 	compact(options: CompactOptions): AgentRun {
-		const agentRun = new AgentRun()
-		agentRun.stream = options.stream === true
-		this.executeCompaction(options, agentRun)
-		return agentRun
+		return startAgentRun(options, (signal, run) => {
+			if (this.uninstrumentedExtensions) run.cleanup.markUncertain('configured-extensions')
+			return this.executeCompaction({ ...options, signal }, run)
+		})
 	}
 
 	private resolveProviderOptions(runId: string, promptCacheKey?: string): ProviderOptions {
@@ -379,6 +423,7 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 	}
 
 	private async executeCompaction(options: CompactOptions, agentRun: AgentRun): Promise<void> {
+		agentRun.cleanup.markUncertain('model-provider-transport')
 		const accumulator = new TokenUsageAccumulator((modelKey) => this.modelProvider.getModelPricing(modelKey))
 		try {
 			if (options.signal?.aborted) {
@@ -581,7 +626,7 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 		}
 	}
 
-	private async executeLoop(options: RunOptions, agentRun: AgentRun): Promise<void> {
+	private async executeLoop(options: RunOptions & { toolSignal?: AbortSignal }, agentRun: AgentRun): Promise<void> {
 		// Hoist mutable state above try/catch so the error path can capture progress
 		const allMessages: ModelMessage[] = [...options.state.messages]
 		const newMessages: ModelMessage[] = []
@@ -641,6 +686,7 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 				state: AgentState,
 				additionalInstructions?: string,
 			): Promise<void> => {
+				agentRun.cleanup.markUncertain('model-provider-transport')
 				const performed = await this.performCompaction(
 					{
 						state,
@@ -667,7 +713,8 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 			const toolCtx: ExecuteToolCallContext = {
 				tools: this.tools,
 				messages: allMessages,
-				signal,
+				// Preserve the public caller-signal identity; instrumented owners use cleanup for stop.
+				signal: options.toolSignal ?? signal,
 				toolState,
 				subAgents,
 				terminalChildren,
@@ -1240,6 +1287,7 @@ export class Agent<TTools extends Record<string, Tool<any, any>> = Record<string
 		agentRun: AgentRun,
 		providerOptions: ProviderOptions,
 	): Promise<ExecutedModelStep> {
+		agentRun.cleanup.markUncertain('model-provider-transport')
 		const result = streamText({
 			model: this.model,
 			tools: this.aiSdkTools,

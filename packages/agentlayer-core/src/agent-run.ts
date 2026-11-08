@@ -1,5 +1,6 @@
 import type { ModelMessage } from 'ai'
 import type { RunResult } from './agent'
+import { type CleanupReceipt, RunCleanup, type StopAndAwaitCleanupOptions } from './cleanup'
 import type { CompactionTrigger } from './compaction'
 import type { ApprovalRequest } from './hooks'
 import type { ApprovalDecision } from './state'
@@ -99,6 +100,33 @@ export type AgentEvent =
 	  } & AgentEventMeta)
 
 export class AgentRun implements AsyncIterable<AgentEvent> {
+	private readonly stopController = new AbortController()
+	readonly cleanup: RunCleanup
+
+	constructor(options: { cleanupParent?: RunCleanup } = {}) {
+		const stopController = this.stopController
+		this.cleanup = new RunCleanup(() => stopController.abort(), options.cleanupParent)
+	}
+
+	get runId(): string {
+		return this.cleanup.runId
+	}
+	get generation(): string {
+		return this.cleanup.generation
+	}
+
+	stopAndAwaitCleanup(options: StopAndAwaitCleanupOptions): Promise<CleanupReceipt> {
+		return this.cleanup.stopAndAwaitCleanup(options)
+	}
+
+	/** @internal Attach before running the SDK producer; settlement alone is not cleanup proof. */
+	startProducer(start: (signal: AbortSignal) => Promise<void>, signal?: AbortSignal): void {
+		const effectiveSignal = signal
+			? AbortSignal.any([signal, this.stopController.signal])
+			: this.stopController.signal
+		this.cleanup.startProducer(() => start(effectiveSignal))
+	}
+
 	private state: { type: 'pending' } | { type: 'resolved'; value: RunResult } = { type: 'pending' }
 
 	private promise: Promise<RunResult> | undefined
@@ -180,7 +208,10 @@ export class AgentRun implements AsyncIterable<AgentEvent> {
 
 	// Push an arbitrary AgentEvent to the stream
 	pushEvent(event: AgentEvent): void {
-		this.onEvent?.(event)
+		if (this.onEvent && this.cleanup.acceptingResources) {
+			this.cleanup.markUncertain('event-observer')
+			this.onEvent(event)
+		}
 		this.events.push(event)
 		if (this.iteratorResolve) {
 			const resolve = this.iteratorResolve

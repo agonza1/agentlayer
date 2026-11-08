@@ -10,6 +10,13 @@ export {
 	type RunResult,
 } from './agent'
 export { type AgentEvent, AgentRun } from './agent-run'
+export {
+	type CleanupReceipt,
+	type CleanupResource,
+	type ResourceCleanupResult,
+	RunCleanup,
+	type StopAndAwaitCleanupOptions,
+} from './cleanup'
 export * from './compaction'
 export {
 	defineTool,

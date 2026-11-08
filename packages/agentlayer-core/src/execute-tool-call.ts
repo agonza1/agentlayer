@@ -98,6 +98,7 @@ export async function executeToolCall(tc: ToolCallRef, ctx: ExecuteToolCallConte
 		getContextWindow: () => Object.freeze([...ctx.messages]) as ReadonlyArray<ModelMessage>,
 		updateContextWindow: (cb) => pendingUpdates.push(cb),
 		signal: ctx.signal,
+		cleanup: ctx.agentRun?.cleanup,
 		stream: ctx.agentRun?.stream,
 		stop: (options?: StopOptions): HookStopResult => {
 			stopRequestedOptions = options ?? {}
@@ -130,6 +131,9 @@ export async function executeToolCall(tc: ToolCallRef, ctx: ExecuteToolCallConte
 			agentId: string,
 			parentToolCallId: string,
 		): Promise<SubAgentResult> => {
+			if (childRun.cleanup?.parent !== parentRun.cleanup) {
+				parentRun.cleanup.markUncertain(`child:${agentId}:unregistered-start`)
+			}
 			// Register child in parent's activeChildren
 			parentRun.activeChildren.add(childRun as AgentRun)
 
@@ -175,7 +179,23 @@ export async function executeToolCall(tc: ToolCallRef, ctx: ExecuteToolCallConte
 	let subAgentPause: { agentId: string; childState: AgentState } | undefined
 
 	try {
-		const raw = await tool.execute(tc.input as Record<string, unknown>, toolCtx)
+		const execute = () => tool.execute(tc.input as Record<string, unknown>, toolCtx)
+		const raw = ctx.agentRun
+			? await ctx.agentRun.cleanup.startResource(`tool:${tc.toolCallId}:${crypto.randomUUID()}`, () => {
+					// Generic tools can start work outside their returned promise. Never infer cleanup from it.
+					ctx.agentRun!.cleanup.markUncertain(`tool:${tc.toolCallId}:uninstrumented`)
+					const result = Promise.resolve(execute())
+					const completed = result.then(
+						() => ({ status: 'uncertain' as const, reason: 'untracked_resource' as const }),
+						() => ({ status: 'uncertain' as const, reason: 'cleanup_failed' as const }),
+					)
+					return {
+						value: result,
+						stop: () => {}, // the run's signal already carries the cooperative stop request
+						waitForCleanup: () => completed,
+					}
+				})
+			: await execute()
 
 		// Check if the tool returned a SubAgentPauseResult
 		if (raw !== null && typeof raw === 'object' && (raw as SubAgentPauseResult).type === 'subAgentPause') {
